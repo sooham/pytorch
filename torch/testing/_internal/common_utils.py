@@ -2025,6 +2025,20 @@ requires_cuda = unittest.skipUnless(torch.cuda.is_available(), "Requires CUDA")
 requires_xpu = unittest.skipUnless(TEST_XPU, "Requires XPU")
 
 
+def add_skip_condition(fn, predicate, reason):
+    """Record on ``fn`` that it skips when ``predicate(test_cls)`` is true.
+
+    Skip decorators call this on the wrapper they return so the decision can
+    be made at collection time (skip_reason_at_collection) without running
+    the test; the wrapper still decides at run time. ``predicate`` receives
+    the test class and returns True, False, or None when it cannot tell
+    before the test runs. Stored as a tuple because functools.wraps copies
+    ``__dict__`` across wrapper layers, so a shared list would leak conditions
+    between tests.
+    """
+    fn._skip_conditions = (*getattr(fn, "_skip_conditions", ()), (predicate, reason))
+
+
 def lazy_skip_if(condition_fn, reason):
     """Skip a test (function or class) when ``condition_fn()`` is true.
 
@@ -2052,6 +2066,7 @@ def lazy_skip_if(condition_fn, reason):
             if condition_fn():
                 raise unittest.SkipTest(reason)
             return fn(*args, **kwargs)
+        add_skip_condition(wrapper, lambda cls: condition_fn(), reason)
         return wrapper
     return decorator
 
@@ -2250,6 +2265,7 @@ def skipIfTorchDynamo(msg="test doesn't currently work with dynamo"):
                     raise unittest.SkipTest(msg)
                 else:
                     fn(*args, **kwargs)
+            add_skip_condition(wrapper, lambda cls: TEST_WITH_TORCHDYNAMO, msg)
             return wrapper
 
         if not isinstance(fn, type):
@@ -2272,6 +2288,7 @@ def skipIfTorchInductor(msg="test doesn't currently work with torchinductor",
                     raise unittest.SkipTest(msg)
                 else:
                     fn(*args, **kwargs)
+            add_skip_condition(wrapper, lambda cls: condition, msg)
             return wrapper
 
         if not isinstance(fn, type):
@@ -2373,6 +2390,7 @@ def skipIfLegacyJitExecutor(msg="test doesn't currently work with legacy JIT exe
                     raise unittest.SkipTest(msg)
                 else:
                     fn(*args, **kwargs)
+            add_skip_condition(wrapper, lambda cls: GRAPH_EXECUTOR == ProfilingMode.LEGACY if GRAPH_EXECUTOR else None, msg)
             return wrapper
 
         if not isinstance(fn, type):
@@ -2508,6 +2526,7 @@ def skipIfNNModuleInlined(
                 else:
                     fn(*args, **kwargs)
 
+            add_skip_condition(wrapper, lambda cls: condition, msg)
             return wrapper
 
         if not isinstance(fn, type):
@@ -2641,6 +2660,13 @@ def skipIfMPS(fn):
             raise unittest.SkipTest(reason)
         return fn(*args, **kwargs)
 
+    def would_skip(cls):
+        if not has_device_arg:
+            return TEST_MPS
+        device_type = getattr(cls, "device_type", None)
+        return None if device_type is None else device_type == "mps"
+
+    add_skip_condition(wrapper, would_skip, reason)
     return wrapper
 
 
@@ -3089,6 +3115,7 @@ def slowTest(fn):
         else:
             fn(*args, **kwargs)
     wrapper.__dict__['slow_test'] = True
+    add_skip_condition(wrapper, lambda cls: not TEST_WITH_SLOW, "test is slow; run with PYTORCH_TEST_WITH_SLOW to enable test")
     return wrapper
 
 
@@ -3505,33 +3532,55 @@ def remove_device_and_dtype_suffixes(test_name: str) -> str:
     return test_name
 
 
+def _matches_test(target: str, classname: str, test_name: str, sanitized_name: str) -> bool:
+    # target is "test_name (module.ClassName)", the key format of slow_tests_dict
+    # and disabled_tests_dict.
+    target_test_parts = target.split()
+    if len(target_test_parts) < 2:
+        # poorly formed target test name
+        return False
+    target_testname = target_test_parts[0]
+    target_classname = target_test_parts[1][1:-1].split(".")[-1]
+    # if test method name or its sanitized version exactly matches the disabled
+    # test method name AND allow non-parametrized suite names to disable
+    # parametrized ones (TestSuite disables TestSuiteCPU)
+    return classname.startswith(target_classname) and (target_testname in (test_name, sanitized_name))
+
+
+def _slow_test_skip_reason(classname: str, test_name: str, sanitized_name: str, test_fn) -> str | None:
+    # Marks the function as slow as a side effect, which _fast_test_skip_reason reads.
+    if any(_matches_test(x, classname, test_name, sanitized_name) for x in slow_tests_dict):
+        if test_fn is not None:
+            vars(test_fn)['slow_test'] = True
+        if not TEST_WITH_SLOW:
+            return "test is slow; run with PYTORCH_TEST_WITH_SLOW to enable test"
+    return None
+
+
+def _fast_test_skip_reason(test_fn) -> str | None:
+    if TEST_SKIP_FAST and test_fn is not None and not vars(test_fn).get('slow_test', False):
+        return "test is fast; we disabled it with PYTORCH_TEST_SKIP_FAST"
+    return None
+
+
 def check_if_enable(test: unittest.TestCase):
     classname = str(test.__class__).split("'")[1].split(".")[-1]
-    sanitized_testname = remove_device_and_dtype_suffixes(test._testMethodName)
+    test_name = test._testMethodName
+    sanitized_testname = remove_device_and_dtype_suffixes(test_name)
+    # Absent when a TestCase is built with the default methodName and setUp()
+    # is called directly, as some test helpers do.
+    test_fn = getattr(test, test_name, None)
 
-    def matches_test(target: str):
-        target_test_parts = target.split()
-        if len(target_test_parts) < 2:
-            # poorly formed target test name
-            return False
-        target_testname = target_test_parts[0]
-        target_classname = target_test_parts[1][1:-1].split(".")[-1]
-        # if test method name or its sanitized version exactly matches the disabled
-        # test method name AND allow non-parametrized suite names to disable
-        # parametrized ones (TestSuite disables TestSuiteCPU)
-        return classname.startswith(target_classname) and (target_testname in (test._testMethodName, sanitized_testname))
-
-    if any(matches_test(x) for x in slow_tests_dict):
-        getattr(test, test._testMethodName).__dict__['slow_test'] = True
-        if not TEST_WITH_SLOW:
-            raise unittest.SkipTest("test is slow; run with PYTORCH_TEST_WITH_SLOW to enable test")
+    reason = _slow_test_skip_reason(classname, test_name, sanitized_testname, test_fn)
+    if reason is not None:
+        raise unittest.SkipTest(reason)
 
     if not IS_SANDCASTLE:
         should_skip = False
         skip_msg = ""
 
         for disabled_test, (issue_url, platforms) in disabled_tests_dict.items():
-            if matches_test(disabled_test):
+            if _matches_test(disabled_test, classname, test_name, sanitized_testname):
                 platform_to_conditional: dict = {
                     "mac": IS_MACOS,
                     "macos": IS_MACOS,
@@ -3578,9 +3627,42 @@ def check_if_enable(test: unittest.TestCase):
                 " disabled tests are run"
             raise unittest.SkipTest(skip_msg)
 
-    if TEST_SKIP_FAST:
-        if hasattr(test, test._testMethodName) and not getattr(test, test._testMethodName).__dict__.get('slow_test', False):
-            raise unittest.SkipTest("test is fast; we disabled it with PYTORCH_TEST_SKIP_FAST")
+    reason = _fast_test_skip_reason(test_fn)
+    if reason is not None:
+        raise unittest.SkipTest(reason)
+
+
+def skip_reason_at_collection(test_cls, test_fn, test_name: str) -> str | None:
+    """Why ``test_name`` would skip before its body runs, or None when that is
+    not knowable without running it.
+
+    Mirrors the run-time order: unittest's static marks on the method or the
+    class, then the slow-tests list and PYTORCH_TEST_SKIP_FAST (check_if_enable
+    in TestCase.setUp), then the conditions skip decorators recorded with
+    add_skip_condition. Disabled-by-issue skips are left to run time on purpose
+    so they keep being reported. A predicate that raises or returns None keeps
+    the test. The slow and fast decisions apply to every subclass of this
+    module's TestCase, including ones whose setUp does not chain to it.
+    """
+    for obj in (test_fn, test_cls):
+        if getattr(obj, "__unittest_skip__", False):
+            return getattr(obj, "__unittest_skip_why__", None) or "skipped"
+    if test_cls is None or test_fn is None:
+        return None
+    if isinstance(test_cls, type) and issubclass(test_cls, TestCase) and hasattr(test_fn, "__dict__"):
+        sanitized_name = remove_device_and_dtype_suffixes(test_name)
+        reason = _slow_test_skip_reason(test_cls.__name__, test_name, sanitized_name, test_fn)
+        if reason is None:
+            reason = _fast_test_skip_reason(test_fn)
+        if reason is not None:
+            return reason
+    for predicate, reason in getattr(test_fn, "_skip_conditions", ()):
+        try:
+            if predicate(test_cls) is True:
+                return reason
+        except Exception:
+            return None
+    return None
 
 
 # `TestCase.assertEqual` is very permissive and coerced the inputs into a format that could be compared. This is very
